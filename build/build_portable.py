@@ -1,348 +1,395 @@
 #!/usr/bin/env python3
-"""Build a reproducible, single-file portable Windows exe for the toolkit.
+"""Build the portable Windows .exe (and .zip) for Backup Restore Toolkit.
 
-The output bundles a pinned Windows embeddable Python runtime (including
-tkinter) plus the toolkit source, so end users do not need Python installed.
-Run on Linux with MinGW-w64 available (or pass --toolchain).
+One command:
+
+    python3 build/build_portable.py
+
+What it does
+------------
+1. Downloads micromamba into build/.cache (once).
+2. Creates a cached win-64 Python 3.12 + Tk environment (the runtime we ship).
+3. Creates a cached Linux cross toolchain (mingw-w64 gcc + windres).
+4. Compiles build/launcher/launcher.c (a tiny self-extracting launcher) with the
+   icon and VERSIONINFO resources from build/assets + build/launcher/launcher.rc.
+5. Assembles the portable folder (runtime + app + launcher.pyw + Run Toolkit.bat).
+6. Zips it deterministically and appends it to the launcher with a WBKZIP01
+   trailer, producing a single self-contained .exe.
+7. Verifies the result: PE header, trailer, archive contents, app hash, resources.
+
+Outputs (in dist/):
+    Backup_Restore_Toolkit_<version>_Portable.exe   <- single file, no Python needed
+    Backup_Restore_Toolkit_<version>_Portable.zip   <- same bundle, unzip + .bat
+
+Nothing is downloaded twice: pass --cache-dir to share a cache, or reuse the
+default build/.cache between runs. Requires only Python 3.8+ on the host.
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
-import json
+import io
 import os
+import platform
+import re
 import shutil
-import stat
+import struct
 import subprocess
 import sys
-import tempfile
-import time
+import tarfile
 import urllib.request
 import zipfile
-from dataclasses import dataclass
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parent.parent
+BUILD = Path(__file__).resolve().parent
+APP_SOURCE = ROOT / "files" / "Backup_Restore_Toolkit.py"
+LAUNCHER_SRC = BUILD / "launcher" / "launcher.c"
+LAUNCHER_RC = BUILD / "launcher" / "launcher.rc"
+BUNDLE_ASSETS = BUILD / "bundle"
+ASSETS = BUILD / "assets"
+
 APP_NAME = "Backup_Restore_Toolkit"
-APP_VERSION = "3.1.0"
-PYTHON_VERSION = "3.12.10"
-PYTHON_RELEASE = f"{PYTHON_VERSION}-embed-amd64"
-PYTHON_URL = f"https://www.python.org/ftp/python/{PYTHON_VERSION}/python-{PYTHON_RELEASE}.zip"
-# SHA-256 of the official embeddable distribution zip.
-PYTHON_SHA256 = "715f957b1b5e3b1de0c4f2b1f3f4f99ed6a6b1f1d6f4b9b4e3f4e2d1c0b9a8f7"  # replaced at runtime check? keep explicit
-# The real hash is verified after download; see EXPECTED_PYTHON_SHA256 below.
-EXPECTED_PYTHON_SHA256 = {
-    "3.12.10-embed-amd64": "5f9b3b1e2e7a0c4b3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4e3f2a1b0c",
-}
+TRAILER_MAGIC = b"WBKZIP01"
+FIXED_ZIP_DATE = (2020, 1, 1, 0, 0, 0)
 
-ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CACHE = ROOT / "build" / ".cache"
-DEFAULT_DIST = ROOT / "dist"
+# Files that must be inside the payload for the app to start.
+REQUIRED_ENTRIES = [
+    "Backup_Restore_Toolkit.py",
+    "launcher.pyw",
+    "app_icon.png",
+    "app_icon.ico",
+    "Run Toolkit.bat",
+    "runtime/pythonw.exe",
+    "runtime/python312.dll",
+    "runtime/DLLs/_tkinter.pyd",
+    "runtime/Lib/tkinter/__init__.py",
+    "runtime/Library/lib/tcl8.6/init.tcl",
+    "runtime/Library/lib/tk8.6/tk.tcl",
+    "runtime/Library/bin/tcl86t.dll",
+    "runtime/Library/bin/tk86t.dll",
+    "runtime/Library/bin/zlib1.dll",
+    "runtime/vcruntime140.dll",
+]
 
-# Reproducibility: fixed timestamp for files written into the embedded payload.
-FIXED_DT = (2020, 1, 1, 0, 0, 0)
-NORMALIZE_EXTS = {".pyc", ".pyd", ".dll", ".exe", ".zip", ".cat", ".pth", ".txt", ".json"}
-
-
-@dataclass
-class Tools:
-    cc: str
-    windres: str
-    strip: str
+# Bulk that is not needed at runtime (saves ~18 MB compressed).
+TRIM_DIRS = [
+    "conda-meta",
+    "Scripts",
+    "include",
+    "Library/include",
+    "Lib/test",
+    "Lib/idlelib",
+    "Lib/ensurepip",
+    "Lib/turtledemo",
+    "Lib/lib2to3",
+    "Lib/site-packages/pip",
+    "Lib/site-packages/setuptools",
+]
+TRIM_GLOBS = ["*.lib", "*.a", "*.pdb"]
 
 
 def log(msg: str) -> None:
-    print(f"[build] {msg}", flush=True)
+    print(msg, flush=True)
 
 
-def sha256_file(path: Path) -> str:
+def step(msg: str) -> None:
+    log(f"\n== {msg}")
+
+
+def run(cmd: list, cwd: Path | None = None, env: dict | None = None) -> None:
+    shown = " ".join(str(c) for c in cmd)
+    log(f"  $ {shown}")
+    subprocess.run([str(c) for c in cmd], cwd=str(cwd) if cwd else None, env=env, check=True)
+
+
+def sha256(path: Path) -> str:
     h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
 
 
-def download(url: str, dest: Path, expected_sha256: str | None = None) -> None:
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    if dest.exists():
-        if expected_sha256:
-            got = sha256_file(dest)
-            if got == expected_sha256:
-                log(f"cache hit: {dest.name}")
-                return
-            log(f"cache hash mismatch for {dest.name}, re-downloading")
-            dest.unlink()
-        else:
-            log(f"cache hit (unverified): {dest.name}")
-            return
-
-    tmp = dest.with_suffix(dest.suffix + ".tmp")
-    log(f"downloading {url}")
-    req = urllib.request.Request(url, headers={"User-Agent": "backup-toolkit-builder/1.0"})
-    with urllib.request.urlopen(req, timeout=300) as resp, tmp.open("wb") as out:
-        shutil.copyfileobj(resp, out)
-    if expected_sha256:
-        got = sha256_file(tmp)
-        if got != expected_sha256:
-            tmp.unlink(missing_ok=True)
-            raise SystemExit(
-                f"SHA-256 mismatch for {url}\n  expected: {expected_sha256}\n  got:      {got}"
-            )
-    tmp.replace(dest)
+def app_version() -> str:
+    text = APP_SOURCE.read_text(encoding="utf-8")
+    match = re.search(r'^VERSION\s*=\s*"([^"]+)"', text, re.M)
+    if not match:
+        raise SystemExit(f"Could not find VERSION in {APP_SOURCE}")
+    return match.group(1)
 
 
-def resolve_tool(name: str, toolchain: str | None) -> str:
-    candidates = []
-    if toolchain:
-        tc = Path(toolchain)
-        if tc.is_dir():
-            candidates += [str(tc / name), str(tc / "bin" / name)]
-        else:
-            candidates.append(str(tc).replace("gcc", name.split("-")[-1]) if "gcc" in str(tc) else str(tc))
-    candidates += [name, f"/usr/bin/{name}", f"/usr/local/bin/{name}"]
-    for c in candidates:
-        if shutil.which(c):
-            return c
-        p = Path(c)
-        if p.exists() and os.access(p, os.X_OK):
-            return str(p)
-    raise SystemExit(f"required tool not found: {name} (tried {candidates[:4]}). Install mingw-w64 or pass --toolchain.")
-
-
-def resolve_tools(toolchain: str | None) -> Tools:
-    prefix = "x86_64-w64-mingw32"
-    return Tools(
-        cc=resolve_tool(f"{prefix}-gcc", toolchain),
-        windres=resolve_tool(f"{prefix}-windres", toolchain),
-        strip=resolve_tool(f"{prefix}-strip", toolchain),
+def host_platform() -> str:
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+    if system == "linux":
+        return "linux-aarch64" if machine in ("aarch64", "arm64") else "linux-64"
+    if system == "darwin":
+        return "osx-arm64" if machine in ("arm64", "aarch64") else "osx-64"
+    raise SystemExit(
+        "This script cross-builds on Linux or macOS. On Windows, run it inside WSL "
+        "(or build a one-file exe with PyInstaller - see build/README.md)."
     )
 
 
-def run(cmd: list[str], cwd: Path | None = None) -> None:
-    log("+ " + " ".join(cmd))
-    subprocess.run(cmd, cwd=str(cwd) if cwd else None, check=True)
+def ensure_micromamba(cache: Path) -> Path:
+    exe = cache / "micromamba" / "bin" / "micromamba"
+    if exe.exists():
+        return exe
+    plat = host_platform()
+    url = f"https://micro.mamba.pm/api/micromamba/{plat}/latest"
+    log(f"  downloading micromamba ({plat}) ...")
+    with urllib.request.urlopen(url, timeout=180) as resp:
+        blob = resp.read()
+    exe.parent.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(fileobj=io.BytesIO(blob), mode="r:bz2") as tf:
+        member = next(m for m in tf.getmembers() if m.name.endswith("bin/micromamba"))
+        member.name = "micromamba"
+        tf.extract(member, path=str(exe.parent))
+    exe.chmod(0o755)
+    return exe
 
 
-def normalize_tree(root: Path) -> None:
-    ts = time.mktime(FIXED_DT + (0, 0, -1))
-    for p in sorted(root.rglob("*")):
-        if p.is_file() and (p.suffix.lower() in NORMALIZE_EXTS or p.name.endswith("._pth")):
+def ensure_env(mm: Path, prefix: Path, specs: list[str], marker: str, cache: Path,
+               win64: bool = False) -> Path:
+    """Create a conda env once, reusing it on later builds."""
+    marker_path = prefix / marker
+    if marker_path.exists():
+        log(f"  reusing {prefix.name}")
+        return prefix
+    if prefix.exists():
+        log(f"  removing incomplete {prefix.name}")
+        shutil.rmtree(prefix, ignore_errors=True)
+    env = dict(os.environ, MAMBA_ROOT_PREFIX=str(cache / "mm-root"))
+    cmd = [mm, "create", "-y", "-p", prefix, "-c", "conda-forge", *specs]
+    if win64:
+        cmd[2:2] = ["--platform", "win-64"]
+    run(cmd, env=env)
+    if not marker_path.exists():
+        raise SystemExit(f"Environment {prefix} was created but {marker} is missing")
+    return prefix
+
+
+def build_runtime(cache: Path, mm: Path) -> Path:
+    step("Windows Python runtime (win-64, with Tk)")
+    return ensure_env(
+        mm, cache / "winpy", ["python=3.12", "tk"], "python.exe", cache, win64=True
+    )
+
+
+def build_toolchain(cache: Path, mm: Path) -> Path:
+    step("Cross toolchain (mingw-w64)")
+    return ensure_env(
+        mm, cache / "toolchain", ["gcc_win-64", "binutils_win-64"],
+        "bin/x86_64-w64-mingw32-gcc", cache,
+    )
+
+
+def trim_runtime(runtime: Path) -> None:
+    for rel in TRIM_DIRS:
+        target = runtime / rel
+        if target.exists():
+            shutil.rmtree(target, ignore_errors=True)
+    for pattern in TRIM_GLOBS:
+        for path in runtime.rglob(pattern):
             try:
-                os.utime(p, (ts, ts))
+                path.unlink()
             except OSError:
                 pass
 
 
-def write_deterministic_zip(zip_path: Path, root: Path) -> None:
-    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
-        for path in sorted(p for p in root.rglob("*") if p.is_file()):
-            rel = path.relative_to(root).as_posix()
-            info = zipfile.ZipInfo(rel, date_time=FIXED_DT)
-            info.compress_type = zipfile.ZIP_DEFLATED
-            info.create_system = 3  # Unix
-            mode = 0o755 if os.access(path, os.X_OK) else 0o644
-            info.external_attr = mode << 16
-            zf.writestr(info, path.read_bytes())
+def _tool(prefix: Path, name: str) -> Path:
+    """Binary inside a toolchain prefix (works for /usr and for conda prefixes)."""
+    candidate = prefix / "bin" / name
+    if not candidate.exists():
+        raise SystemExit(f"Toolchain is missing {name}: {candidate} does not exist")
+    return candidate
 
 
-def prepare_runtime(cache_dir: Path, work: Path) -> Path:
-    runtime_zip = cache_dir / f"python-{PYTHON_RELEASE}.zip"
-    expected = EXPECTED_PYTHON_SHA256.get(PYTHON_RELEASE)
-    download(PYTHON_URL, runtime_zip, expected)
+def compile_launcher(toolchain: Path, work: Path, version: str) -> Path:
+    step(f"Launcher executable (v{version})")
+    work.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(ASSETS / "app_icon.ico", work / "app.ico")
+    shutil.copy2(LAUNCHER_SRC, work / "launcher.c")
+    shutil.copy2(BUILD / "launcher" / "miniz.c", work / "miniz.c")
+    shutil.copy2(BUILD / "launcher" / "miniz.h", work / "miniz.h")
 
-    runtime_dir = work / "python"
-    if runtime_dir.exists():
-        shutil.rmtree(runtime_dir)
-    runtime_dir.mkdir(parents=True)
-    log(f"extracting runtime to {runtime_dir}")
-    with zipfile.ZipFile(runtime_zip) as zf:
-        zf.extractall(runtime_dir)
+    version_comma = ",".join((version.split(".") + ["0", "0", "0", "0"])[:4])
+    rc_text = LAUNCHER_RC.read_text(encoding="utf-8")
+    rc_text = rc_text.replace("@VERSION@", version).replace("@VERSION_COMMA@", version_comma)
+    (work / "launcher.rc").write_text(rc_text, encoding="utf-8")
 
-    # Enable site/import of bundled packages where needed; keep it minimal.
-    pth = next(runtime_dir.glob("python*._pth"), None)
-    if pth:
-        text = pth.read_text(encoding="utf-8", errors="ignore")
-        if "#import site" in text:
-            pth.write_text(text.replace("#import site", "import site"), encoding="utf-8")
-
-    normalize_tree(runtime_dir)
-    return runtime_dir
-
-
-def stage_payload(work: Path, runtime_dir: Path) -> Path:
-    stage = work / "stage"
-    if stage.exists():
-        shutil.rmtree(stage)
-    (stage / "python").mkdir(parents=True)
-    # copy runtime
-    for item in runtime_dir.iterdir():
-        dest = stage / "python" / item.name
-        if item.is_dir():
-            shutil.copytree(item, dest)
-        else:
-            shutil.copy2(item, dest)
-
-    app_dir = stage / "app"
-    app_dir.mkdir()
-    src = ROOT / "files" / f"{APP_NAME}.py"
-    if not src.exists():
-        raise SystemExit(f"missing app source: {src}")
-    shutil.copy2(src, app_dir / f"{APP_NAME}.py")
-    for name in ("launcher.pyw", "README.txt", "Run Toolkit.bat"):
-        p = ROOT / "build" / "bundle" / name
-        if p.exists():
-            shutil.copy2(p, app_dir / name if name != "Run Toolkit.bat" else stage / name)
-
-    provenance = {
-        "app": APP_NAME,
-        "version": APP_VERSION,
-        "python_runtime": PYTHON_RELEASE,
-        "python_url": PYTHON_URL,
-        "built_by": "build/build_portable.py",
-    }
-    (app_dir / "build-provenance.json").write_text(json.dumps(provenance, indent=2) + "\n", encoding="utf-8")
-    (app_dir / "version.txt").write_text(f"{APP_NAME} {APP_VERSION}\n", encoding="utf-8")
-
-    normalize_tree(stage)
-    return stage
-
-
-def compile_launcher(tools: Tools, work: Path) -> Path:
-    launcher_src = ROOT / "build" / "launcher" / "launcher.c"
-    rc_src = ROOT / "build" / "launcher" / "launcher.rc"
-    miniz_src = ROOT / "build" / "launcher" / "miniz.c"
-    icon = ROOT / "build" / "assets" / "app_icon.ico"
-    for p in (launcher_src, rc_src, miniz_src, icon):
-        if not p.exists():
-            raise SystemExit(f"missing build input: {p}")
-
-    res = work / "launcher.res.o"
-    obj = work / "launcher.o"
-    miniz_obj = work / "miniz.o"
-    exe = work / f"{APP_NAME}_{APP_VERSION}_Portable.exe"
-
-    run([tools.windres, "-I", str(ROOT / "build" / "launcher"), "-I", str(ROOT / "build" / "assets"),
-         "-O", "coff", str(rc_src), str(res)])
-    cflags = ["-O2", "-s", "-DUNICODE", "-D_UNICODE", "-DMINIZ_NO_ARCHIVE_APIS",
-              "-DMINIZ_NO_ZLIB_APIS", "-DMINIZ_NO_ZLIB_COMPATIBLE_NAMES",
-              "-Wall", "-Wextra", "-Wno-unused-parameter"]
-    run([tools.cc, *cflags, "-c", str(miniz_src), "-o", str(miniz_obj)])
-    run([tools.cc, *cflags, "-c", str(launcher_src), "-o", str(obj)])
-    run([tools.cc, *cflags, "-municode", "-mwindows", "-Wl,--no-insert-timestamp",
-         str(obj), str(miniz_obj), str(res),
-         "-lshlwapi", "-lshell32", "-lole32", "-luuid", "-luser32",
-         "-o", str(exe)])
-    run([tools.strip, "--strip-all", str(exe)])
+    env = dict(os.environ, PATH=f"{toolchain / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}")
+    run([_tool(toolchain, "x86_64-w64-mingw32-windres"),
+         "-c", "65001", "-I.", "launcher.rc", "launcher_res.o"],
+        cwd=work, env=env)
+    exe = work / "launcher.exe"
+    run([
+        _tool(toolchain, "x86_64-w64-mingw32-gcc"),
+        "-O2", "-mwindows", "-o", str(exe), f'-DAPP_VERSION="{version}"',
+        "launcher.c", "miniz.c", "launcher_res.o",
+        "-static", "-static-libgcc", "-Wl,--no-insert-timestamp",
+    ], cwd=work, env=env)
+    if not exe.exists():
+        raise SystemExit("Launcher compilation failed")
     return exe
 
 
-def append_payload(exe: Path, payload_zip: Path) -> None:
-    payload = payload_zip.read_bytes()
-    marker = b"WBKZIP01"
-    size = len(payload).to_bytes(8, "little")
-    with exe.open("ab") as f:
-        f.write(payload)
-        f.write(marker)
-        f.write(size)
+def assemble_bundle(bundle: Path, runtime: Path, version: str) -> None:
+    step("Portable bundle")
+    if bundle.exists():
+        shutil.rmtree(bundle)
+    bundle.mkdir(parents=True)
+
+    log("  copying runtime ...")
+    shutil.copytree(runtime, bundle / "runtime", symlinks=True)
+    trim_runtime(bundle / "runtime")
+
+    shutil.copy2(APP_SOURCE, bundle / "Backup_Restore_Toolkit.py")
+    shutil.copy2(BUNDLE_ASSETS / "launcher.pyw", bundle / "launcher.pyw")
+    shutil.copy2(BUNDLE_ASSETS / "Run Toolkit.bat", bundle / "Run Toolkit.bat")
+    shutil.copy2(ASSETS / "app_icon.png", bundle / "app_icon.png")
+    shutil.copy2(ASSETS / "app_icon.ico", bundle / "app_icon.ico")
+
+    readme = (BUNDLE_ASSETS / "README.txt").read_text(encoding="utf-8")
+    (bundle / "README.txt").write_text(readme.replace("@VERSION@", version), encoding="utf-8")
 
 
-def verify_payload(exe: Path) -> None:
+def write_zip_deterministic(src: Path, out: Path) -> None:
+    """Zip a folder with sorted entries and fixed timestamps (reproducible)."""
+    files = sorted(p for p in src.rglob("*") if p.is_file())
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+        for path in files:
+            rel = path.relative_to(src).as_posix()
+            info = zipfile.ZipInfo(rel, date_time=FIXED_ZIP_DATE)
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = 0o644 << 16
+            zf.writestr(info, path.read_bytes())
+
+
+def make_exe(launcher: Path, payload: Path, out: Path) -> None:
+    """Concatenate launcher + zip + 16-byte trailer (magic + payload offset)."""
+    launcher_bytes = launcher.read_bytes()
+    payload_bytes = payload.read_bytes()
+    out.write_bytes(launcher_bytes + payload_bytes + TRAILER_MAGIC + struct.pack("<Q", len(launcher_bytes)))
+
+
+def verify(exe: Path, payload: Path, version: str) -> None:
+    step("Verification")
     data = exe.read_bytes()
-    if data[:2] != b"MZ":
-        raise SystemExit("verification failed: not an MZ executable")
-    if b"WBKZIP01" not in data[-32:]:
-        # marker+size is 16 bytes at end
-        pass
-    idx = data.rfind(b"WBKZIP01")
-    if idx < 0:
-        raise SystemExit("verification failed: payload marker missing")
-    size = int.from_bytes(data[idx + 8 : idx + 16], "little")
-    start = idx - size
-    if start < 0:
-        raise SystemExit("verification failed: payload size invalid")
-    blob = data[start:idx]
-    if len(blob) != size:
-        raise SystemExit("verification failed: payload truncated")
-    with zipfile.ZipFile(tempfile.SpooledTemporaryFile(max_size=20_000_000)) as _:
-        pass
-    # quick zip sanity
-    import io
-    with zipfile.ZipFile(io.BytesIO(blob)) as zf:
+    problems: list[str] = []
+
+    if not data.startswith(b"MZ"):
+        problems.append("not a Windows executable (missing MZ header)")
+    if data[-16:-8] != TRAILER_MAGIC:
+        problems.append("missing WBKZIP01 trailer")
+    else:
+        offset = struct.unpack("<Q", data[-8:])[0]
+        if data[offset:offset + 4] != b"PK\x03\x04":
+            problems.append("payload offset does not point at a ZIP archive")
+
+    with zipfile.ZipFile(payload) as zf:
         names = set(zf.namelist())
+        for entry in REQUIRED_ENTRIES:
+            if entry not in names:
+                problems.append(f"payload missing {entry}")
+        packed_app = zf.read("Backup_Restore_Toolkit.py")
+        if hashlib.sha256(packed_app).hexdigest() != sha256(APP_SOURCE):
+            problems.append("packaged app differs from source")
+        if any(n.lower().endswith(".pdb") for n in names):
+            problems.append("payload contains debug symbols (*.pdb)")
         bad = zf.testzip()
         if bad:
-            raise SystemExit(f"verification failed: corrupt zip entry {bad}")
-    required = [f"app/{APP_NAME}.py", "app/launcher.pyw"]
-    missing = [r for r in required if not any(n.endswith(r) or n == r for n in names)]
-    if missing:
-        raise SystemExit(f"verification failed: missing payload entries {missing}")
-    log("verification passed: MZ header, payload marker, zip integrity, required files present")
+            problems.append(f"corrupt entry in payload: {bad}")
+
+    # VERSIONINFO strings are UTF-16LE; check they are present in the launcher part.
+    launcher_bytes = data[:len(data) - len(payload.read_bytes()) - 16]
+    for text in ("FileVersion", "ProductName", version):
+        if text.encode("utf-16-le") not in launcher_bytes:
+            problems.append(f"version resource missing {text!r}")
+
+    if problems:
+        for p in problems:
+            log(f"  FAIL: {p}")
+        raise SystemExit("Verification failed")
+
+    log(f"  exe       {exe.stat().st_size:,} bytes  sha256 {sha256(exe)}")
+    log(f"  payload   {payload.stat().st_size:,} bytes, {len(names)} files")
+    log("  checks    PE header, trailer, archive, app hash, version resource: OK")
 
 
-def write_dist(exe: Path, dist_dir: Path) -> None:
-    dist_dir.mkdir(parents=True, exist_ok=True)
-    out_exe = dist_dir / exe.name
-    shutil.copy2(exe, out_exe)
-    (out_exe.parent).mkdir(parents=True, exist_ok=True)
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Build the portable Windows exe/zip")
+    parser.add_argument("--cache-dir", default=str(BUILD / ".cache"),
+                        help="where to keep micromamba, the win-64 runtime and toolchain")
+    parser.add_argument("--dist-dir", default=str(ROOT / "dist"), help="output folder")
+    parser.add_argument("--skip-verify", action="store_true", help="skip post-build checks")
+    parser.add_argument("--toolchain", metavar="PREFIX",
+                        help="use an existing mingw-w64 prefix (e.g. /usr on CI) instead of "
+                             "downloading one; the prefix must contain bin/x86_64-w64-mingw32-gcc")
+    args = parser.parse_args()
 
-    sums = dist_dir / "SHA256SUMS.txt"
-    lines = [f"{sha256_file(out_exe)}  {out_exe.name}\n"]
-    zip_out = dist_dir / f"{APP_NAME}_{APP_VERSION}_Portable.zip"
-    with zipfile.ZipFile(zip_out, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
-        for p in (out_exe, sums):
-            if p.exists() or p == sums:
-                continue
-        info = zipfile.ZipInfo(out_exe.name, date_time=FIXED_DT)
-        info.compress_type = zipfile.ZIP_DEFLATED
-        info.external_attr = 0o755 << 16
-        zf.writestr(info, out_exe.read_bytes())
-    lines.append(f"{sha256_file(zip_out)}  {zip_out.name}\n")
-    sums.write_text("".join(lines), encoding="utf-8")
-    # add sums into zip? keep zip stable by writing without it; sums file remains alongside.
-    log(f"wrote {out_exe} ({out_exe.stat().st_size:,} bytes)")
-    log(f"wrote {zip_out} ({zip_out.stat().st_size:,} bytes)")
-    log(f"wrote {sums}")
+    if os.name == "nt":
+        raise SystemExit(
+            "Run this on Linux/macOS (or WSL). On plain Windows use PyInstaller - "
+            "see build/README.md."
+        )
+    if not APP_SOURCE.exists():
+        raise SystemExit(f"Missing source: {APP_SOURCE}")
+    for needed in [LAUNCHER_SRC, LAUNCHER_RC, ASSETS / "app_icon.ico", ASSETS / "app_icon.png",
+                   BUNDLE_ASSETS / "launcher.pyw", BUNDLE_ASSETS / "Run Toolkit.bat",
+                   BUNDLE_ASSETS / "README.txt"]:
+        if not needed.exists():
+            raise SystemExit(f"Missing build input: {needed}")
 
+    cache = Path(args.cache_dir).resolve()
+    dist = Path(args.dist_dir).resolve()
+    cache.mkdir(parents=True, exist_ok=True)
+    dist.mkdir(parents=True, exist_ok=True)
+    work = cache / "work"
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--cache-dir", default=str(DEFAULT_CACHE))
-    p.add_argument("--dist-dir", default=str(DEFAULT_DIST))
-    p.add_argument("--toolchain", default=None, help="MinGW-w64 bin dir or prefix, e.g. /usr")
-    p.add_argument("--skip-verify", action="store_true")
-    p.add_argument("--keep-work", action="store_true")
-    return p.parse_args(argv)
+    version = app_version()
+    log(f"Backup Restore Toolkit {version}")
+    log(f"cache: {cache}")
+    log(f"dist:  {dist}")
 
+    mm = ensure_micromamba(cache)
+    runtime = build_runtime(cache, mm)
+    if args.toolchain:
+        toolchain = Path(args.toolchain).resolve()
+        _tool(toolchain, "x86_64-w64-mingw32-gcc")
+        log(f"\n== Cross toolchain\n  using system toolchain {toolchain}")
+    else:
+        toolchain = build_toolchain(cache, mm)
+    launcher = compile_launcher(toolchain, work, version)
 
-def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv)
-    cache_dir = Path(args.cache_dir).resolve()
-    dist_dir = Path(args.dist_dir).resolve()
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    work = Path(tempfile.mkdtemp(prefix="wbk-build-", dir=str(cache_dir)))
-    log(f"work dir: {work}")
-    try:
-        tools = resolve_tools(args.toolchain)
-        log(f"tools: cc={tools.cc}, windres={tools.windres}, strip={tools.strip}")
-        runtime_dir = prepare_runtime(cache_dir, work)
-        stage = stage_payload(work, runtime_dir)
-        payload_zip = work / "payload.zip"
-        write_deterministic_zip(payload_zip, stage)
-        log(f"payload: {payload_zip} ({payload_zip.stat().st_size:,} bytes, sha256 {sha256_file(payload_zip)})")
-        exe = compile_launcher(tools, work)
-        append_payload(exe, payload_zip)
-        if not args.skip_verify:
-            verify_payload(exe)
-        write_dist(exe, dist_dir)
-        log("done")
-        return 0
-    finally:
-        if args.keep_work:
-            log(f"keeping work dir: {work}")
-        else:
-            shutil.rmtree(work, ignore_errors=True)
+    bundle = work / "bundle"
+    assemble_bundle(bundle, runtime, version)
+
+    step("Packaging")
+    payload = work / "payload.zip"
+    write_zip_deterministic(bundle, payload)
+    log(f"  payload.zip {payload.stat().st_size:,} bytes")
+
+    exe = dist / f"{APP_NAME}_{version}_Portable.exe"
+    make_exe(launcher, payload, exe)
+    zip_out = dist / f"{APP_NAME}_{version}_Portable.zip"
+    shutil.copy2(payload, zip_out)
+
+    step("Outputs")
+    log(f"  {exe}  ({exe.stat().st_size:,} bytes)")
+    log(f"  {zip_out}  ({zip_out.stat().st_size:,} bytes)")
+
+    if not args.skip_verify:
+        verify(exe, payload, version)
+
+    log("\nDone.")
+    return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except subprocess.CalledProcessError as exc:
+        raise SystemExit(f"Command failed ({exc.returncode}): {exc.cmd}")

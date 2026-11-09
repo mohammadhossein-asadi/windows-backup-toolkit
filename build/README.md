@@ -1,98 +1,101 @@
-# Building the portable Windows exe
+# Portable Windows build
 
-This folder contains the deterministic build system that packages
-`files/Backup_Restore_Toolkit.py` into a single Windows x64 executable with a
-bundled Python runtime.
-
-## What it produces
-
-`python3 build/build_portable.py` writes to `dist/` by default:
-
-- `Backup_Restore_Toolkit_3.1.0_Portable.exe` — the single-file launcher
-- `Backup_Restore_Toolkit_3.1.0_Portable.zip` — the exe plus checksums
-- `SHA256SUMS.txt` — SHA-256 hashes for verification
-
-The exe is a native MinGW-w64 launcher that:
-
-1. extracts a private, versioned runtime to `%LOCALAPPDATA%\BackupRestoreToolkit\…`
-   (a stable hash of the embedded payload, so it does not re-extract every run),
-2. runs the bundled `launcher.pyw`, which prefers the packaged toolkit copy and
-   falls back to a `Backup_Restore_Toolkit*.py` file next to the exe, and
-3. starts the tkinter app with the bundled stdlib/tkinter runtime.
-
-## Prerequisites (Linux, cross-compiling)
+One command rebuilds the single-file portable `.exe` (and the equivalent `.zip`)
+for the toolkit:
 
 ```bash
-sudo apt-get update
-sudo apt-get install -y mingw-w64 ca-certificates python3
+python3 build/build_portable.py
 ```
 
-The script needs `x86_64-w64-mingw32-gcc`, `x86_64-w64-mingw32-windres`, and
-`x86_64-w64-mingw32-strip` (or a toolchain prefix passed via `--toolchain`).
+Outputs land in `dist/`:
 
-## Build
+| File | What it is |
+| --- | --- |
+| `Backup_Restore_Toolkit_<version>_Portable.exe` | Single self-extracting app, no Python needed |
+| `Backup_Restore_Toolkit_<version>_Portable.zip` | Same bundle, unzip and double-click `Run Toolkit.bat` |
 
-```bash
-# From the repo root
-python3 build/build_portable.py --toolchain /usr --dist-dir dist
-```
+## How it works
 
-On first run it downloads and verifies the pinned Windows embeddable Python
-distribution (SHA-256 checked) and caches it in `build/.cache/`.
+1. **Toolchain** – downloads `micromamba` once into `build/.cache`, then creates two
+   cached environments:
+   - `build/.cache/winpy` – win-64 Python 3.12 + Tk (the runtime that gets shipped)
+   - `build/.cache/toolchain` – `gcc_win-64` + `binutils_win-64` for cross-compiling
+2. **Launcher** – compiles `build/launcher/launcher.c` (with `miniz` for unzipping)
+   plus `build/launcher/launcher.rc`, which embeds the icon and Windows version info.
+3. **Bundle** – copies the runtime, trims docs/tests/headers, adds the app,
+   `launcher.pyw`, `Run Toolkit.bat`, the readme and both icon files.
+4. **Package** – writes a deterministic ZIP, then concatenates
+   `launcher.exe + payload.zip + "WBKZIP01" + offset`.
+5. **Verify** – checks the PE header, trailer and payload offset, opens the embedded
+   archive, confirms every required file, confirms the packaged `Backup_Restore_Toolkit.py`
+   is byte-identical to `files/Backup_Restore_Toolkit.py`, and checks the version strings.
 
-Useful flags:
+At runtime the exe unpacks once to `%LOCALAPPDATA%\WindowsBackupToolkit\app-<version>`
+and starts `runtime\pythonw.exe launcher.pyw`, so there is no console window and no
+Python installation on the target machine.
 
-- `--cache-dir PATH` — where the runtime and work files are cached
-  (default `build/.cache`)
-- `--toolchain /usr` or `--toolchain /path/to/prefix` — MinGW-w64 location
-- `--dist-dir PATH` — output directory (default `dist`)
-- `--skip-verify` — skip the static payload/zip verification step (faster local
-  iteration; CI and releases should keep verification on)
-- `--keep-work` — keep the staging directory for inspection
+## Requirements
 
-## Determinism
+- Linux or macOS host (or WSL). Python 3.8+ and network access on the first run.
+- After the first run everything is cached: later builds work offline and take
+  well under a minute for packaging (the ~130 MB runtime copy dominates).
 
-Identical inputs produce the same `Backup_Restore_Toolkit_3.1.0_Portable.exe`
-hash. The script normalizes timestamps inside the embedded runtime (`.pyc`,
-`.pyd`, `.dll`, `.exe`, zip entries) and passes `-Wl,--no-insert-timestamp` to
-the MinGW linker.
-
-Reproduce locally:
-
-```bash
-python3 build/build_portable.py --toolchain /usr --dist-dir dist-a
-python3 build/build_portable.py --toolchain /usr --dist-dir dist-b
-sha256sum dist-a/Backup_Restore_Toolkit_3.1.0_Portable.exe \
-          dist-b/Backup_Restore_Toolkit_3.1.0_Portable.exe
-```
-
-The hashes must match (assuming the same source, script, and cached runtime).
-
-## Payload layout (inside the exe's embedded zip)
+## Options
 
 ```
-python/        # Windows embeddable runtime + stdlib + tkinter
-app/
-  Backup_Restore_Toolkit.py
-  launcher.pyw
-  README.txt
-  build-provenance.json
-  version.txt
-Run Toolkit.bat
+--cache-dir PATH   where micromamba/runtime/toolchain are kept (default build/.cache)
+--dist-dir PATH    output folder (default dist/)
+--toolchain PREFIX use an existing mingw-w64 prefix (e.g. /usr) instead of downloading one
+--skip-verify      skip the post-build checks
 ```
 
-## Versioning & releases
+## Changing the icon or version
 
-`APP_VERSION` in `build/build_portable.py` must match the version the toolkit
-reports. The GitHub Actions workflow builds on push/PR and, on non-PR events,
-publishes/updates a GitHub Release tagged `v<version>` with the exe, zip and
-checksums.
+- Icon: replace `build/assets/app_icon.png` (256×256) and `build/assets/app_icon.ico`
+  (multi-size). The app loads `app_icon.png` for its window icon, the exe embeds the `.ico`.
+- Version: edit `VERSION` in `files/Backup_Restore_Toolkit.py`. The exe name and the
+  Windows version resource follow it automatically.
 
-## CI workflow check
+## Automatic builds on GitHub
+
+`.github/workflows/build-portable.yml` builds the exe on every push that touches the
+source or the build system, and publishes a GitHub Release named after the version:
+
+- Bump `VERSION` in `files/Backup_Restore_Toolkit.py` and push to `main`.
+- The workflow installs Ubuntu's mingw-w64 cross compiler (fast, no 1.5 GB cache),
+  restores the cached Windows runtime, and runs `build_portable.py --toolchain /usr`.
+- It creates release `v<version>` (or replaces the files if that release already exists)
+  with the `.exe`, the `.zip` and `SHA256SUMS.txt`.
+- Pushing a tag like `v3.2.0` also works; a tag that disagrees with `VERSION` fails the
+  build instead of publishing a misleading download.
+- Pull requests only run the build and keep the result as a workflow artifact.
+
+Requirements: the repository default token needs *Contents: write*, which the workflow
+requests explicitly. No secrets are involved.
+
+Check the workflow locally after editing it (needs PyYAML):
 
 ```bash
 python3 build/check_workflow.py
 ```
 
-This validates the workflow YAML and does a lightweight sanity pass (required
-jobs/steps present, scripts parse).
+It parses the YAML and runs `bash -n` on every `run:` block, so shell typos are caught
+before pushing.
+
+## On native Windows
+
+Cross-compiling from Windows is not covered here. Two options:
+
+```bat
+py -m pip install pyinstaller
+py -m PyInstaller --onefile --windowed --icon build\assets\app_icon.ico ^
+    --name Backup_Restore_Toolkit files\Backup_Restore_Toolkit.py
+```
+
+(`--add-data "app_icon.png;."` if you also want the window icon), or run this script
+inside WSL, which produces the exact same artifact as CI/Linux builds.
+
+## Third-party code
+
+`build/launcher/miniz.c` / `miniz.h` are [miniz](https://github.com/richgel999/miniz)
+by Rich Geldreich, MIT licensed, used only to unpack the embedded archive.

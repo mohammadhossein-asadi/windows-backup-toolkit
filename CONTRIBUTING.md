@@ -1,92 +1,79 @@
 # Contributing
 
-Thanks for taking the time to improve the Backup & Restore Toolkit.
+Short version: the app is one stdlib-only Python file, the exe is built cross-platform
+with one command, and a pull request should keep both working.
 
-## What this project is
+## Run it from source
 
-A portable, **Windows-only** tkinter app packaged as a single-file exe. The
-source of truth for the shipped payload is
-[`files/Backup_Restore_Toolkit.py`](files/Backup_Restore_Toolkit.py).
+You need Windows 10/11 and **Python 3.10+ with Tk** (the python.org installer includes it
+by default). There are no dependencies to install — the app imports only the standard
+library and Tk.
 
-## Before you start
-
-- Keep changes focused. This is a safety-oriented backup tool; prefer small,
-  reviewable diffs over large refactors.
-- **Do not weaken safety checks** to make a run "pass" (integrity sampling,
-  resume markers, skip/exclusion logging, preflight, error reporting). If a
-  behavior must change, explain why and update the docs/tests that cover it.
-- Avoid adding third-party runtime dependencies to the app — it is intentionally
-  close to stdlib-only so the portable exe stays predictable.
-- Never commit secrets, real Wi-Fi passwords/keys, personal backup data, or
-  machine-specific paths.
-
-## Development setup
-
-You only need Python to edit the app source:
-
-```bash
-git clone https://github.com/mohammadhossein-asadi/windows-backup-toolkit.git
-cd windows-backup-toolkit
-python files/Backup_Restore_Toolkit.py   # on Windows
+```bat
+python -m tkinter                        :: sanity check: should open a test window
+python Backup_Restore_Toolkit.py         :: runs with a console for log output
+pythonw Backup_Restore_Toolkit.py        :: runs without a console
 ```
 
-For a quick syntax check on any platform:
+Start it **as administrator** when touching driver, registry, `hosts` or Wi-Fi code;
+those paths are skipped otherwise. `app_icon.png` next to the script gives the window its
+custom icon.
+
+## Where things live
+
+All application code is in `files/Backup_Restore_Toolkit.py` (~5800 lines, in sections):
+
+- **Settings and defaults** — `DEFAULT_SETTINGS`, skip rules, ignore lists near the top.
+- **`BackupToolkit`** — backup/restore engine: stage methods, manifest, integrity,
+  hardlinks, retention.
+- **`App`** — the Tk interface: Dashboard, Backup, Restore, Settings pages and dialogs.
+- **`main()`** at the bottom — the only entry point.
+
+Keep the existing widget and method contracts intact (`self.txt`, `append_log`, the named
+buttons, settings keys). Other parts of the UI and the portable launcher depend on them.
+
+## Rebuild the portable exe
+
+The build cross-compiles, so run it on **Linux, macOS or WSL**. On plain Windows use
+PyInstaller instead — see [build/README.md](build/README.md).
 
 ```bash
-python -m py_compile files/Backup_Restore_Toolkit.py
+python3 build/build_portable.py
 ```
 
-## Building the portable exe
+That pulls a Windows Python runtime and a mingw-w64 cross compiler into
+`build/.cache` on first use, then writes `dist/Backup_Restore_Toolkit_<version>_Portable.exe`
+and `.zip`. Later runs take about ten seconds. `py build/build_portable.py --skip-verify`
+skips the self-checks; `--toolchain <prefix>` reuses an existing compiler.
 
-The build runs on Linux and cross-compiles a Windows x64 exe:
+The build always re-reads `VERSION` from the source, so bumping it is all that's needed
+for a new file name, a new Windows version resource, and a new GitHub release.
 
-```bash
-python3 build/build_portable.py --toolchain /usr --dist-dir dist
-```
+## Before opening a pull request
 
-It downloads a pinned Windows embeddable Python runtime on first run (cached in
-`build/.cache/`) and needs MinGW-w64 (`x86_64-w64-mingw32-gcc`, `windres`,
-`strip`). The build is deterministic: identical inputs produce the same exe
-hash.
+1. **Bump `VERSION`** in `files/Backup_Restore_Toolkit.py`.
+2. Run the app and do a quick manual pass:
+   - Full backup of a small folder, then **Verify** it.
+   - Compact backup on top of it, then **Preview** and restore to a scratch folder.
+   - Cancel a backup mid-run and confirm it **resumes** rather than restarts.
+   - Settings: add a skip folder/extension and confirm it is honoured.
+3. Build the exe on Linux/macOS/WSL and launch it: `python3 build/build_portable.py`.
+4. If you touched the workflow: `python3 build/check_workflow.py`.
 
-Validate the workflow definition before opening a PR:
+Tests are manual today — describe what you ran in the pull request. Say explicitly if
+something was not checked (for example "not tested on a second machine").
 
-```bash
-python3 build/check_workflow.py
-```
+## Style
 
-## Pull requests
+- Standard library only. No new third-party dependencies, no network calls at runtime.
+- Windows-first, but don't crash on other platforms — the app already tolerates Linux for
+  layout work.
+- User-facing text: plain words, no jargon, say what will happen before doing it.
+- Destructive actions (delete, overwrite, restore) need a confirmation or a preview.
+- Log meaningful stages and warnings; errors should say what to do next.
 
-1. Create a branch from `main`.
-2. Make the smallest change that fully addresses the issue.
-3. Update [`README.md`](README.md) / [`docs/HINTS.md`](docs/HINTS.md) and add an
-   entry under **Unreleased** in [`CHANGELOG.md`](CHANGELOG.md) for user-visible
-   changes.
-4. Bump `APP_VERSION` in `files/Backup_Restore_Toolkit.py` (and keep the build
-   script in sync) only when preparing a release — don't bump it in unrelated PRs
-   unless asked.
-5. Run the checks you touched (`py_compile`, `build/check_workflow.py`, and/or a
-   local build) and report exactly what you ran.
+## Releases
 
-## Reporting bugs & requesting features
-
-- **Bugs:** include your Windows version, what you were backing up/restoring, the
-  steps to reproduce, and the relevant log lines or the `backup_summary.json` /
-  exclusion report (redact personal paths if needed).
-- **Features:** describe the problem you're trying to solve, not just the
-  solution. Backup/restore changes should call out safety, performance and
-  resume/rollback implications.
-
-## Code style
-
-- Match the existing style in the file you edit (this codebase favors clear,
-  explicit logic over clever abstractions).
-- Keep UI text short and actionable; log technical detail rather than showing it
-  in dialogs.
-- Prefer standard library APIs; guard Windows-specific calls so the module can
-  still be imported/checked on non-Windows platforms where practical.
-
-## License
-
-By contributing, you agree that your contributions are licensed under the
-[MIT License](LICENSE).
+Pushing a version bump to `main` makes GitHub Actions build and publish a release named
+`v<version>`. Pushing tag `v<version>` works too; a tag that disagrees with `VERSION`
+fails the build on purpose.

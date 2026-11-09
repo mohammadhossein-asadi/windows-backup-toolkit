@@ -1,70 +1,69 @@
 # Changelog
 
-All notable user-facing changes to this project are documented here.
+Notable changes, newest first. The canonical version is `VERSION` in
+`files/Backup_Restore_Toolkit.py`; the portable exe's file name and Windows version
+resource follow it automatically.
 
-The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
-toolkit uses semantic-style versioning.
+Earlier history predates this repository, so the 3.0.0 entry summarises what the v3
+baseline already provided rather than recording every commit.
 
-## [3.1.0] - 2026-11-09
+## 3.1.0 — 9 November 2026
 
-### Added
+Cheaper repeat backups, verification you can run on demand, and a real portable build.
 
-- **Integrity sampling mode** with a configurable file percentage (1–100%) to
-  verify a representative subset during backup and restore.
-- **Resume** for interrupted operations via per-output folder markers
-  (`.backup-in-progress.json`, `.restore-in-progress.json`), so completed files
-  and the current index are reused on the next run.
-- **Skip rules** (glob patterns, default `*.tmp;~$*;Thumbs.db`) and an
-  **exclusion history** panel with reasons and the last 20 skipped entries.
-- **Retention policy** (keep last N / keep days) that cleans up old backup
-  folders after a successful run.
-- **Incremental-link backups**: unchanged files (same relative path and size,
-  with sampled hash confirmation) reuse bytes from the previous backup via
-  NTFS hard links; a dashboard counter shows how much data was reused.
-- **Compact mode** to reduce RAM/CPU usage on slower machines, with safe
-  adaptive chunk sizing and cooperative yields during scans.
-- **Real-time dashboard** (progress, ETA, files copied, bytes written, current
-  file) and detailed logs for backup/restore and validation steps.
-- **Polished portable Windows build**: a native launcher with a custom icon and
-  embedded version information, a one-command reproducible build script, and
-  build provenance embedded in the payload.
-- **Automated release workflow**: GitHub Actions builds the portable exe/zip and
-  publishes a release with checksums for the checked-in version.
+### Added — backup modes
 
-### Changed
+- **Compact (changed-only) backups.** Only new or modified files are written, so a run
+  costs a fraction of a full backup. Restores merge the parent backup automatically —
+  you pick the compact folder and the missing files come from its base.
+- **Incremental hardlink mode.** Unchanged files are hardlinked from the previous
+  backup, so each snapshot looks complete but only changed data uses disk space.
+- **Hardlink preflight warning.** Before an incremental run the destination is probed;
+  if hardlinks cannot work (different volume, non-NTFS filesystem, permissions) the app
+  says so up front, with the reason and the alternatives, instead of failing partway.
 
-- The bundled toolkit is now treated as a self-contained portable app: no
-  external Python install is required to run the exe.
-- Driver export/report and installed-programs export are written as structured,
-  bounded artifacts alongside the backup for easier review.
-- Wi-Fi profile export stores **names only** by default; password export is an
-  explicit opt-in.
+### Added — trust and safety
+
+- **Integrity hash sampling.** `integrity.json` stores SHA-256 samples of the backup so
+  silent corruption — which size and modification time cannot catch — is detectable.
+- **Verify backup** tool (Tools menu), checking manifest, stage folders and optionally
+  the hash sample, with a readable per-check report.
+- **Resume interrupted backup.** A lightweight in-progress manifest is written as the
+  backup runs, so a cancelled or crashed run continues where it stopped instead of
+  starting over.
+- **Retention policy.** Keep the last *N* backups and/or remove backups older than *M*
+  days, with a preview before anything is deleted, an optional automatic run after each
+  backup, and a guard that never removes the only good full backup.
+
+### Added — control and visibility
+
+- **Custom skip rules** for folder names, file names and extensions, alongside the
+  built-in ignore list of build, cache and temporary folders.
+- **Dashboard "Data written / reused"** card, showing bytes actually copied versus
+  bytes reused, so the savings from incremental and compact runs are visible.
+
+### Added — packaging
+
+- Custom application icon (16–256 px) used by the exe, Explorer and the app window.
+- Windows VERSIONINFO resource: product name, version 3.1.0, file description and
+  original filename, so Properties and task manager show something meaningful.
+- Single-file portable exe that carries its own Python runtime and starts with no
+  console window, plus an equivalent zip for anyone who prefers unpacking.
+- Reproducible cross-build (`build/build_portable.py`) and a GitHub Actions workflow
+  that publishes a release whenever `VERSION` changes.
 
 ### Fixed
 
-- Deterministic portable builds: identical inputs now produce the same exe hash
-  across runs (timestamp-normalized runtime files and PE link stamp).
-- Safer backup hygiene: lock/temp files, junction targets, and explicitly
-  excluded patterns are recorded rather than copied blindly.
-- More resilient backup/restore flows: per-file failures are logged without
-  abandoning the whole run, and preflight checks catch common destination and
-  permission problems early.
+- Opening the integrity check crashed: the dialog handler was referenced but never
+  defined.
 
-### Notes
+## 3.0.0 — earlier
 
-- Targets **Windows 10/11 (64-bit)**. A Windows SmartScreen prompt is expected
-  for unsigned builds; verify the published checksums before running.
-- `files/Backup_Restore_Toolkit.py` is the source of truth for the portable
-  payload.
+The v3 baseline this version builds on: parallel backup stages, deferred blob restore,
+resume tokens, decorated progress and detail logging, cancellation safety, ZIP/7-Zip
+archiving, cross-version manifest plumbing, structured state, and a pluggable logger.
 
-## [3.0.0] - 2025-??-??
+## Repository
 
-### Added
-
-- Single-file tkinter backup & restore toolkit with full backups, selectable
-  categories, driver export, Wi-Fi profile name export, environment report,
-  restore from a backup folder, and a configurable `settings.json` next to the
-  app.
-
-[3.1.0]: https://github.com/mohammadhossein-asadi/windows-backup-toolkit/compare/v3.0.0...v3.1.0
-[3.0.0]: https://github.com/mohammadhossein-asadi/windows-backup-toolkit/releases/tag/v3.0.0
+Project scaffolding added around 3.1.0 rather than in the app itself: README, hints for
+users, contributor guide, MIT license, build documentation and the release pipeline.
