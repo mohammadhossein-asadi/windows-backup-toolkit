@@ -2446,7 +2446,7 @@ class BackupToolkit:
         self._pause_event.set()
         self.completed_stages = []
         self.failed_stages = []
-        self.set_total(0)
+        self.log_obj.set_total(0)
         self._started_at = time.perf_counter()
 
         if not self.backup_root:
