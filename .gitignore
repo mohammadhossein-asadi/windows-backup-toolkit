@@ -1,0 +1,1 @@
+# Build output\ndist/\nbuild/.cache/\nbuild/.cache/work/\n\n# Python\n__pycache__/\n*.py[cod]\nartifacts/\n
